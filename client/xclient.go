@@ -47,6 +47,7 @@ type XClient interface {
 	Go(ctx context.Context, serviceMethod string, args interface{}, reply interface{}, done chan *Call) (*Call, error)
 	Call(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
 	Broadcast(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
+	Multicast(ctx context.Context, keys []string, serviceMethod string, args interface{}, reply interface{}) error
 	Fork(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error
 	SendRaw(ctx context.Context, r *protocol.Message) (map[string]string, []byte, error)
 	SendFile(ctx context.Context, fileName string, rateInBytesPerSecond int64, meta map[string]string) error
@@ -816,6 +817,80 @@ func (c *xClient) Broadcast(ctx context.Context, serviceMethod string, args inte
 	clients := make(map[string]RPCClient)
 	c.mu.Lock()
 	for k := range c.servers {
+		client, err := c.getCachedClientWithoutLock(k, c.servicePath, serviceMethod)
+		if err != nil {
+			continue
+		}
+		clients[k] = client
+	}
+	c.mu.Unlock()
+
+	if len(clients) == 0 {
+		return ErrXClientNoServer
+	}
+
+	err := &ex.MultiError{}
+	l := len(clients)
+	done := make(chan bool, l)
+	for k, client := range clients {
+		k := k
+		client := client
+		go func() {
+			e := c.wrapCall(ctx, client, serviceMethod, args, reply)
+			done <- (e == nil)
+			if e != nil {
+				if uncoverError(err) {
+					c.removeClient(k, c.servicePath, serviceMethod, client)
+				}
+				err.Append(e)
+			}
+		}()
+	}
+
+	timeout := time.After(time.Minute)
+check:
+	for {
+		select {
+		case result := <-done:
+			l--
+			if l == 0 || !result { // all returns or some one returns an error
+				break check
+			}
+		case <-timeout:
+			err.Append(errors.New(("timeout")))
+			break check
+		}
+	}
+
+	if err.Error() == "[]" {
+		return nil
+	}
+	return err
+}
+
+// Multicast sends requests to multi servers and Success only when all servers return OK.
+// FailMode and SelectMode are meanless for this method.
+// Please set timeout to avoid hanging.
+func (c *xClient) Multicast(ctx context.Context, keys []string, serviceMethod string, args interface{}, reply interface{}) error {
+	if c.isShutdown {
+		return ErrXClientShutdown
+	}
+
+	if c.auth != "" {
+		metadata := ctx.Value(share.ReqMetaDataKey)
+		if metadata == nil {
+			metadata = map[string]string{}
+			ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
+		}
+		m := metadata.(map[string]string)
+		m[share.AuthKey] = c.auth
+	}
+
+	ctx = setServerTimeout(ctx)
+
+	clients := make(map[string]RPCClient)
+	c.mu.Lock()
+	for _, k := range keys {
 		client, err := c.getCachedClientWithoutLock(k, c.servicePath, serviceMethod)
 		if err != nil {
 			continue
