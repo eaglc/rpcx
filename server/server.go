@@ -96,6 +96,8 @@ type Server struct {
 	AuthFunc func(ctx context.Context, req *protocol.Message, token string) error
 
 	handlerMsgNum int32
+
+	HandleServiceError func(error)
 }
 
 // NewServer returns a server.
@@ -299,7 +301,7 @@ func (s *Server) serveListener(ln net.Listener) error {
 
 		conn, ok := s.Plugins.DoPostConnAccept(conn)
 		if !ok {
-			closeChannel(s, conn)
+			conn.Close()
 			continue
 		}
 
@@ -344,6 +346,12 @@ func (s *Server) serveByWS(ln net.Listener, rpcPath string) {
 }
 
 func (s *Server) serveConn(conn net.Conn) {
+
+	if s.isShutdown() {
+		s.closeConn(conn)
+		return
+	}
+
 	defer func() {
 		if err := recover(); err != nil {
 			const size = 64 << 10
@@ -355,22 +363,13 @@ func (s *Server) serveConn(conn net.Conn) {
 			buf = buf[:ss]
 			log.Errorf("serving %s panic error: %s, stack:\n %s", conn.RemoteAddr(), err, buf)
 		}
+
 		if share.Trace {
 			log.Debugf("server closed conn: %v", conn.RemoteAddr().String())
 		}
 
-		s.mu.Lock()
-		delete(s.activeConn, conn)
-		s.mu.Unlock()
-		conn.Close()
-
-		s.Plugins.DoPostConnClose(conn)
+		s.closeConn(conn)
 	}()
-
-	if isShutdown(s) {
-		closeChannel(s, conn)
-		return
-	}
 
 	if tlsConn, ok := conn.(*tls.Conn); ok {
 		if d := s.readTimeout; d != 0 {
@@ -388,8 +387,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	r := bufio.NewReaderSize(conn, ReaderBuffsize)
 
 	for {
-		if isShutdown(s) {
-			closeChannel(s, conn)
+		if s.isShutdown() {
 			return
 		}
 
@@ -402,6 +400,8 @@ func (s *Server) serveConn(conn net.Conn) {
 
 		req, err := s.readRequest(ctx, r)
 		if err != nil {
+			protocol.FreeMsg(req)
+
 			if err == io.EOF {
 				log.Infof("client has closed this connection: %s", conn.RemoteAddr().String())
 			} else if strings.Contains(err.Error(), "use of closed network connection") {
@@ -461,6 +461,7 @@ func (s *Server) serveConn(conn net.Conn) {
 				req.SetMessageType(protocol.Response)
 				data := req.EncodeSlicePointer()
 				conn.Write(*data)
+				protocol.FreeMsg(req)
 				protocol.PutData(data)
 				return
 			}
@@ -481,7 +482,11 @@ func (s *Server) serveConn(conn net.Conn) {
 			}
 			res, err := s.handleRequest(ctx, req)
 			if err != nil {
-				log.Warnf("rpcx: failed to handle request: %v", err)
+				if s.HandleServiceError != nil {
+					s.HandleServiceError(err)
+				} else {
+					log.Warnf("rpcx: failed to handle request: %v", err)
+				}
 			}
 
 			s.Plugins.DoPreWriteResponse(ctx, req, res, err)
@@ -538,15 +543,18 @@ func parseServerTimeout(ctx *share.Context, req *protocol.Message) context.Cance
 	return cancel
 }
 
-func isShutdown(s *Server) bool {
+func (s *Server) isShutdown() bool {
 	return atomic.LoadInt32(&s.inShutdown) == 1
 }
 
-func closeChannel(s *Server, conn net.Conn) {
+func (s *Server) closeConn(conn net.Conn) {
 	s.mu.Lock()
 	delete(s.activeConn, conn)
 	s.mu.Unlock()
+
 	conn.Close()
+
+	s.Plugins.DoPostConnClose(conn)
 }
 
 func (s *Server) readRequest(ctx context.Context, r io.Reader) (req *protocol.Message, err error) {
